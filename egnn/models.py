@@ -198,7 +198,7 @@ class EGNN_encoder_QM9(nn.Module):
         edges = [x.to(self.device) for x in edges]
         node_mask = node_mask.view(bs*n_nodes, 1)
         edge_mask = edge_mask.view(bs*n_nodes*n_nodes, 1)
-        xh = xh.view(bs*n_nodes, -1).clone() * node_mask
+        xh = xh.view(bs*n_nodes, -1).clone() * node_mask # (bs*n_nodes, dims)
         x = xh[:, 0:self.n_dims].clone()
         if h_dims == 0:
             h = torch.ones(bs*n_nodes, 1).to(self.device)
@@ -235,14 +235,14 @@ class EGNN_encoder_QM9(nn.Module):
 
         h_final = self.final_mlp(h_final)
         h_final = h_final * node_mask if node_mask is not None else h_final
-        h_final = h_final.view(bs, n_nodes, -1)
+        h_final = h_final.view(bs, n_nodes, -1) # (bs, n_nodes, out_node_nf*2 + 1)
 
-        vel_mean = vel
-        vel_std = h_final[:, :, :1].sum(dim=1, keepdim=True).expand(-1, n_nodes, -1)
+        vel_mean = vel # (bs, n_nodes, 3)
+        vel_std = h_final[:, :, :1].sum(dim=1, keepdim=True).expand(-1, n_nodes, -1) # (bs, n_nodes, 1)
         vel_std = torch.exp(0.5 * vel_std)
 
-        h_mean = h_final[:, :, 1:1 + self.out_node_nf]
-        h_std = torch.exp(0.5 * h_final[:, :, 1 + self.out_node_nf:])
+        h_mean = h_final[:, :, 1:1 + self.out_node_nf] # (bs, n_nodes, out_node_nf)
+        h_std = torch.exp(0.5 * h_final[:, :, 1 + self.out_node_nf:]) # (bs, n_nodes, out_node_nf)
 
         if torch.any(torch.isnan(vel_std)):
             print('Warning: detected nan in vel_std, resetting to one.')
@@ -363,7 +363,7 @@ class EGNN_decoder_QM9(nn.Module):
         else:
             raise Exception("Wrong mode %s" % self.mode)
 
-        vel = vel.view(bs, n_nodes, -1)
+        vel = vel.view(bs, n_nodes, -1) # (bs, n_nodes, 3)
 
         if torch.any(torch.isnan(vel)):
             print('Warning: detected nan, resetting EGNN output to zero.')

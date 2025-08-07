@@ -939,7 +939,7 @@ class EnHierarchicalVAE(torch.nn.Module):
 
         # Encoder output.
         z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.encode(x, h, node_mask, edge_mask, context)
-        
+        # z_x_mu (bs, n_nodes, n_dims) z_x_sigma (bs, n_nodes, 1) z_h_mu (bs, n_nodes, latent_nf) z_h_sigma (bs, n_nodes, latent_nf)
         # KL distance.
         # KL for invariant features.
         zeros, ones = torch.zeros_like(z_h_mu), torch.ones_like(z_h_sigma)
@@ -1007,7 +1007,7 @@ class EnHierarchicalVAE(torch.nn.Module):
 
         # Encoder output.
         z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.encoder._forward(xh, node_mask, edge_mask, context)
-
+        # z_x_mu (bs, n_nodes, n_dims) z_x_sigma (bs, n_nodes, 1) z_h_mu (bs, n_nodes, latent_nf) z_h_sigma (bs, n_nodes, latent_nf)
         bs, _, _ = z_x_mu.size()
         sigma_0_x = torch.ones(bs, 1, 1).to(z_x_mu) * 0.0032
         sigma_0_h = torch.ones(bs, 1, self.latent_node_nf).to(z_h_mu) * 0.0032
