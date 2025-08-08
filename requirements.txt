@@ -14,3 +14,4 @@ rdkit==2025.3.5
 requests==2.31.0
 ipykernel==6.28.0
 jupyterlab==4.0.10
+imageio==2.37.0
