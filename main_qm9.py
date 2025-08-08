@@ -257,17 +257,18 @@ for partition, loader in dataloaders.items():
             loader.dataset,
             num_replicas=args.world_size,
             rank=args.rank,
-            shuffle=(partition == 'train'), # Only shuffle train data
-            drop_last=True # Ensure same number of samples for each process
+            shuffle=(partition == 'train'),
+            drop_last=True
         )
         # Recreate DataLoader with sampler
         dataloaders[partition] = torch.utils.data.DataLoader(
             loader.dataset,
-            batch_size=loader.batch_size, # This is already PER_GPU_BATCH_SIZE
+            batch_size=loader.batch_size,
             sampler=sampler,
             num_workers=args.num_workers,
             pin_memory=True,
-            drop_last=True # Important for consistent batch sizes across processes
+            drop_last=True, 
+            collate_fn=loader.collate_fn
         )
 
 rag_db = None
@@ -279,14 +280,11 @@ if args.use_rag:
 
     prop_keys = args.conditioning
     rag_db.build_db(rag_dataset, prop_keys)
-data_dummy = next(iter(dataloaders['train']))
-
 
 if len(args.conditioning) > 0:
     print(f'Conditioning on {args.conditioning}')
     property_norms = compute_mean_mad(dataloaders, args.conditioning, args.dataset)
-    context_dummy = prepare_context(args.conditioning, data_dummy, property_norms)
-    context_node_nf = context_dummy.size(2)
+    context_node_nf = len(args.conditioning)
 else:
     context_node_nf = 0
     property_norms = None
@@ -320,6 +318,8 @@ def check_mask_correct(variables, node_mask):
 
 
 def main():
+    global model
+    
     if args.resume is not None:
         flow_state_dict = torch.load(join(args.resume, 'flow.npy'), map_location=device)
         optim_state_dict = torch.load(join(args.resume, 'optim.npy'), map_location=device)
@@ -327,7 +327,7 @@ def main():
         optim.load_state_dict(optim_state_dict)
 
     if args.world_size > 1:
-        model = DDP(model, device_ids=[args.local_rank])
+        model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)
 
     # Initialize model copy for exponential moving average of params.
     if args.ema_decay > 0:
