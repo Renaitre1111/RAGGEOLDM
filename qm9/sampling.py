@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked
 from qm9.analyze import check_stability
+import qm9.utils as qm9utils
 
 
 def rotate_chain(z):
@@ -51,7 +52,7 @@ def reverse_tensor(x):
     return x[torch.arange(x.size(0) - 1, -1, -1)]
 
 
-def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
+def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None, rag_aggregator=None, rag_db=None):
     n_samples = 1
     if args.dataset == 'qm9' or args.dataset == 'qm9_second_half' or args.dataset == 'qm9_first_half':
         n_nodes = 19
@@ -63,12 +64,34 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
     # TODO FIX: This conditioning just zeros.
     if args.context_node_nf > 0:
         context = prop_dist.sample(n_nodes).unsqueeze(1).unsqueeze(0)
-        context = context.repeat(1, n_nodes, 1).to(device)
+        context = context.repeat(1, n_nodes, 1).to(device) # (n_samples, n_nodes, context_node_nf)
         #context = torch.zeros(n_samples, n_nodes, args.context_node_nf).to(device)
     else:
         context = None
 
     node_mask = torch.ones(n_samples, n_nodes, 1).to(device)
+
+    adaln_ctx = None
+    if args.use_rag:
+        if context is not None:
+            target_norm = context[:, 0, :] # (bs, num_prop)
+        else: # Fallback if no context conditioning at all, sample new target values for RAG
+             target_norm = prop_dist.sample(n_nodes).to(device)
+
+        target_norm = target_norm.unsqueeze(1) # (bs, 1, num_prop)
+
+        target_unnorm = qm9utils.unnormalize_context(target_norm, args.conditioning, prop_dist.normalizer)
+        target_unnorm_ret = target_unnorm[:, 0, :].cpu().numpy() # (bs, num_prop)
+        ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
+
+        ret_mol_embs = torch.from_numpy(ret_mol_embs).to(device, dtype=torch.float32)
+        ret_prop_vals = torch.from_numpy(ret_prop_vals).to(device, dtype=torch.float32)
+        ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype=torch.float32)
+
+        adaln_ctx = rag_aggregator(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (1, agg_dim)
+        
+        adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1) * node_mask # (bs, max_n_nodes, agg_dim)
+
 
     edge_mask = (1 - torch.eye(n_nodes)).unsqueeze(0)
     edge_mask = edge_mask.repeat(n_samples, 1, 1).view(-1, 1).to(device)
@@ -109,7 +132,7 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
 
 def sample(args, device, generative_model, dataset_info,
            prop_dist=None, nodesxsample=torch.tensor([10]), context=None,
-           fix_noise=False):
+           fix_noise=False, rag_aggregator=None, rag_db=None):
     max_n_nodes = dataset_info['max_n_nodes']  # this is the maximum node_size in QM9
 
     assert int(torch.max(nodesxsample)) <= max_n_nodes
@@ -131,12 +154,34 @@ def sample(args, device, generative_model, dataset_info,
     if args.context_node_nf > 0:
         if context is None:
             context = prop_dist.sample_batch(nodesxsample)
-        context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+        context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask # (bs, max_n_nodes, context_node_nf)
     else:
         context = None
+    
+    adaln_ctx = None
+    if args.use_rag:
+        if context is not None:
+            target_norm = context[:, 0, :] # (bs, num_prop)
+        else: # Fallback if no context conditioning at all, sample new target values for RAG
+             target_norm = prop_dist.sample_batch(nodesxsample).to(device)
+        
+        target_norm = target_norm.unsqueeze(1) # (bs, 1, num_prop)
+
+        target_unnorm = qm9utils.unnormalize_context(target_norm, args.conditioning, prop_dist.normalizer)
+        target_unnorm_ret = target_unnorm[:, 0, :].cpu().numpy() # (bs, num_prop)
+        ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
+
+        ret_mol_embs = torch.from_numpy(ret_mol_embs).to(device, dtype=torch.float32)
+        ret_prop_vals = torch.from_numpy(ret_prop_vals).to(device, dtype=torch.float32)
+        ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype=torch.float32)
+
+        adaln_ctx = rag_aggregator(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (1, agg_dim)
+        
+        adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, max_n_nodes, 1) * node_mask # (bs, max_n_nodes, agg_dim)
+        
 
     if args.probabilistic_model == 'diffusion':
-        x, h = generative_model.sample(batch_size, max_n_nodes, node_mask, edge_mask, context, fix_noise=fix_noise)
+        x, h = generative_model.sample(batch_size, max_n_nodes, node_mask, edge_mask, context, fix_noise=fix_noise, adaln_ctx=adaln_ctx)
 
         assert_correctly_masked(x, node_mask)
         assert_mean_zero_with_mask(x, node_mask)
@@ -154,7 +199,7 @@ def sample(args, device, generative_model, dataset_info,
     return one_hot, charges, x, node_mask
 
 
-def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_dist, n_nodes=19, n_frames=100):
+def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_dist, n_nodes=19, n_frames=100, rag_aggregator=None, rag_db=None):
     nodesxsample = torch.tensor([n_nodes] * n_frames)
 
     context = []
@@ -167,5 +212,5 @@ def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_
         context.append(context_row)
     context = torch.cat(context, dim=1).float().to(device)
 
-    one_hot, charges, x, node_mask = sample(args, device, generative_model, dataset_info, prop_dist, nodesxsample=nodesxsample, context=context, fix_noise=True)
+    one_hot, charges, x, node_mask = sample(args, device, generative_model, dataset_info, prop_dist, nodesxsample=nodesxsample, context=context, fix_noise=True, rag_aggregator=rag_aggregator, rag_db=rag_db)
     return one_hot, charges, x, node_mask

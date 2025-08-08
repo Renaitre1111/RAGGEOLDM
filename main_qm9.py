@@ -17,8 +17,10 @@ from equivariant_diffusion import utils as flow_utils
 import torch
 import time
 import pickle
-from qm9.utils import prepare_context, compute_mean_mad
+from qm9.utils import prepare_context, compute_mean_mad, unnormalize_context
 from train_test import train_epoch, test, analyze_and_save
+from rag_utils import MolRAG
+from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='E3Diffusion')
 parser.add_argument('--exp_name', type=str, default='debug_10')
@@ -130,6 +132,15 @@ parser.add_argument('--normalization_factor', type=float, default=1,
                     help="Normalize the sum aggregation of EGNN")
 parser.add_argument('--aggregation_method', type=str, default='sum',
                     help='"sum" or "mean"')
+# RAG specific arguments
+parser.add_argument('--use_rag', action='store_true', help='Whether to use Retrieval Augmented Generation (RAG).')
+parser.add_argument('--rag_k', type=int, default=8, help='Number of retrieved items for RAG.')
+parser.add_argument('--chemberta_path', type=str, default='DeepChem/ChemBERTa-77M-MTM', help='Path to ChemBERTa model for molecular embeddings.')
+parser.add_argument('--rag_mol_emb_dim', type=int, default=384, help='Dimension of molecular embeddings used by RAGAggregator (e.g., ChemBERTa hidden size).')
+parser.add_argument('--rag_num_prop', type=int, default=1, help='Number of properties for RAG (e.g., 12 for QM9). Should match len(conditioning).')
+parser.add_argument('--rag_agg_dim', type=int, default=128, help='Aggregation dimension for RAG context.')
+parser.add_argument('--batch_size_chemberta', type=int, default=32, help='Batch size for ChemBERTa embedding computation.')
+
 args = parser.parse_args()
 
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
@@ -152,6 +163,12 @@ if args.resume is not None:
     normalization_factor = args.normalization_factor
     aggregation_method = args.aggregation_method
 
+    # Store current RAG arguments to override loaded ones if they exist
+    current_rag_args = {}
+    for arg_name in ['use_rag', 'rag_k', 'chemberta_path', 'rag_mol_emb_dim', 'rag_num_prop', 'rag_agg_dim', 'batch_size_chemberta']:
+        if hasattr(args, arg_name):
+            current_rag_args[arg_name] = getattr(args, arg_name)
+
     with open(join(args.resume, 'args.pickle'), 'rb') as f:
         args = pickle.load(f)
 
@@ -167,6 +184,10 @@ if args.resume is not None:
         args.normalization_factor = normalization_factor
     if not hasattr(args, 'aggregation_method'):
         args.aggregation_method = aggregation_method
+
+    # Restore RAG args to the loaded args object
+    for k, v in current_rag_args.items():
+        setattr(args, k, v)
 
     print(args)
 
@@ -184,9 +205,21 @@ kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffus
 wandb.init(**kwargs)
 wandb.save('*.txt')
 
+log_dir = join('outputs', args.exp_name, 'tensorboard_logs')
+writer = SummaryWriter(log_dir)
+
 # Retrieve QM9 dataloaders
 dataloaders, charge_scale = dataset.retrieve_dataloaders(args)
 
+rag_db = None
+if args.use_rag:
+    rag_db = MolRAG(args)
+
+    rag_data_path = join(args.datadir, args.dataset + '_smiles_dataset.pt')
+    rag_dataset = torch.load(rag_data_path)
+
+    prop_keys = args.conditioning
+    rag_db.build_db(rag_dataset, prop_keys)
 data_dummy = next(iter(dataloaders['train']))
 
 
@@ -203,9 +236,9 @@ args.context_node_nf = context_node_nf
 
 # Create Latent Diffusion Model or Audoencoder
 if args.train_diffusion:
-    model, nodes_dist, prop_dist = get_latent_diffusion(args, device, dataset_info, dataloaders['train'])
+    model, nodes_dist, prop_dist, rag_aggregator = get_latent_diffusion(args, device, dataset_info, dataloaders['train'])
 else:
-    model, nodes_dist, prop_dist = get_autoencoder(args, device, dataset_info, dataloaders['train'])
+    model, nodes_dist, prop_dist, rag_aggregator = get_autoencoder(args, device, dataset_info, dataloaders['train'])
 
 if prop_dist is not None:
     prop_dist.set_normalizer(property_norms)
@@ -254,32 +287,59 @@ def main():
 
     best_nll_val = 1e8
     best_nll_test = 1e8
+    best_epoch_val = -1
+
+    global_step = args.start_epoch * len(dataloaders['train'])
+
     for epoch in range(args.start_epoch, args.n_epochs):
         start_epoch = time.time()
         train_epoch(args=args, loader=dataloaders['train'], epoch=epoch, model=model, model_dp=model_dp,
                     model_ema=model_ema, ema=ema, device=device, dtype=dtype, property_norms=property_norms,
                     nodes_dist=nodes_dist, dataset_info=dataset_info,
-                    gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist)
+                    gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist, 
+                    rag_aggregator=rag_aggregator, rag_db=rag_db,
+                    writer=writer, global_step=global_step)
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
+
+        global_step += len(dataloaders['train']) 
 
         if epoch % args.test_epochs == 0:
             if isinstance(model, en_diffusion.EnVariationalDiffusion):
                 wandb.log(model.log_info(), commit=True)
+                if writer: writer.add_text("Model_Info", str(model.log_info()), global_step=epoch) # Example of logging text
 
             if not args.break_train_epoch and args.train_diffusion:
                 analyze_and_save(args=args, epoch=epoch, model_sample=model_ema, nodes_dist=nodes_dist,
                                  dataset_info=dataset_info, device=device,
-                                 prop_dist=prop_dist, n_samples=args.n_stability_samples)
+                                 prop_dist=prop_dist, n_samples=args.n_stability_samples, 
+                                 rag_aggregator=rag_aggregator, rag_db=rag_db)
             nll_val = test(args=args, loader=dataloaders['valid'], epoch=epoch, eval_model=model_ema_dp,
-                           partition='Val', device=device, dtype=dtype, nodes_dist=nodes_dist,
-                           property_norms=property_norms)
+                           partition='Val', device=device, dtype=dtype, 
+                           nodes_dist=nodes_dist, property_norms=property_norms, 
+                           rag_aggregator=rag_aggregator, rag_db=rag_db,
+                           writer=writer)
             nll_test = test(args=args, loader=dataloaders['test'], epoch=epoch, eval_model=model_ema_dp,
                             partition='Test', device=device, dtype=dtype,
-                            nodes_dist=nodes_dist, property_norms=property_norms)
+                            nodes_dist=nodes_dist, property_norms=property_norms,
+                            rag_aggregator=rag_aggregator, rag_db=rag_db,
+                            writer=writer)
+            
+            wandb.log({"Val loss ": nll_val, "epoch": epoch}, commit=True)
+            wandb.log({"Test loss ": nll_test, "epoch": epoch}, commit=True)
+            if writer:
+                writer.add_scalar("NLL/Validation", nll_val, global_step=epoch)
+                writer.add_scalar("NLL/Test", nll_test, global_step=epoch)
 
             if nll_val < best_nll_val:
                 best_nll_val = nll_val
                 best_nll_test = nll_test
+                best_epoch_val = epoch
+
+                if writer:
+                    writer.add_scalar("NLL/Best_Validation", best_nll_val, global_step=epoch)
+                    writer.add_scalar("NLL/Best_Test", best_nll_test, global_step=epoch)
+                    writer.add_scalar("NLL/Best_Epoch", best_epoch_val, global_step=epoch)
+
                 if args.save_model:
                     args.current_epoch = epoch + 1
                     utils.save_model(optim, 'outputs/%s/optim.npy' % args.exp_name)
@@ -289,6 +349,7 @@ def main():
                     with open('outputs/%s/args.pickle' % args.exp_name, 'wb') as f:
                         pickle.dump(args, f)
 
+                '''
                 if args.save_model:
                     utils.save_model(optim, 'outputs/%s/optim_%d.npy' % (args.exp_name, epoch))
                     utils.save_model(model, 'outputs/%s/generative_model_%d.npy' % (args.exp_name, epoch))
@@ -296,12 +357,14 @@ def main():
                         utils.save_model(model_ema, 'outputs/%s/generative_model_ema_%d.npy' % (args.exp_name, epoch))
                     with open('outputs/%s/args_%d.pickle' % (args.exp_name, epoch), 'wb') as f:
                         pickle.dump(args, f)
+                '''
             print('Val loss: %.4f \t Test loss:  %.4f' % (nll_val, nll_test))
             print('Best val loss: %.4f \t Best test loss:  %.4f' % (best_nll_val, best_nll_test))
             wandb.log({"Val loss ": nll_val}, commit=True)
             wandb.log({"Test loss ": nll_test}, commit=True)
             wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
-
+    if writer:
+        writer.close()
 
 if __name__ == "__main__":
     main()

@@ -1,13 +1,66 @@
 import torch
 from torch.distributions.categorical import Categorical
+import torch.nn as nn
 
 import numpy as np
 from egnn.models import EGNN_dynamics_QM9, EGNN_encoder_QM9, EGNN_decoder_QM9
 
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion, EnHierarchicalVAE, EnLatentDiffusion
+from equivariant_diffusion import utils as diffusion_utils
 
 import pickle
 from os.path import join
+
+class RAGAggregator(nn.Module):
+    def __init__(self, mol_emb_dim, num_prop, agg_dim):
+        super().__init__()
+        self.mol_emb_dim = mol_emb_dim
+        self.num_prop = num_prop
+        self.agg_dim = agg_dim
+
+        self.Q_mlp = nn.Sequential(
+            nn.Linear(num_prop, agg_dim),
+            nn.SiLU()
+        )
+
+        self.K_mlp = nn.Sequential(
+            nn.Linear(mol_emb_dim + num_prop * 2, agg_dim),
+            nn.SiLU()
+        )
+
+        self.V_mlp = nn.Sequential(
+            nn.Linear(mol_emb_dim + num_prop * 2, agg_dim),
+            nn.SiLU()
+        )
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, target_val, ret_mol_embs, ret_prop_vals, ret_dist_to_targs, k_mask=None):
+
+        Q = self.Q_mlp(target_val).unsqueeze(1) # (bs, 1, agg_dim)
+        K_V_input = torch.cat([ret_mol_embs, ret_prop_vals, ret_dist_to_targs], dim=-1)
+        K = self.K_mlp(K_V_input)  # (bs, k, agg_dim)
+        V = self.V_mlp(K_V_input)  # (bs, k, agg_dim)
+
+        attn_scores = torch.bmm(Q, K.transpose(1, 2)).squeeze(1)  # (bs, k)
+
+        if k_mask is not None:
+            attn_scores = attn_scores.masked_fill(~k_mask, -torch.inf)
+            
+        attn_weights = self.softmax(attn_scores).unsqueeze(1)  # (bs, 1, k)
+
+        rag_emb = torch.bmm(attn_weights, V).squeeze(1)  # (bs, agg_dim)
+
+        return rag_emb
+    
+def _create_rag_aggregator(args):
+    if hasattr(args, 'use_rag') and args.use_rag:
+        if not hasattr(args, 'rag_mol_emb_dim') or \
+           not hasattr(args, 'rag_num_prop') or \
+           not hasattr(args, 'rag_agg_dim'):
+            raise ValueError("RAG is enabled but missing 'rag_mol_emb_dim', 'rag_num_prop', or 'rag_agg_dim' in args.")
+        return RAGAggregator(args.rag_mol_emb_dim, args.rag_num_prop, args.rag_agg_dim)
+    return None
 
 def get_model(args, device, dataset_info, dataloader_train):
     histogram = dataset_info['n_nodes']
@@ -24,13 +77,16 @@ def get_model(args, device, dataset_info, dataloader_train):
         print('Warning: dynamics model is _not_ conditioned on time.')
         dynamics_in_node_nf = in_node_nf
 
+    rag_c_nf = args.rag_agg_dim if hasattr(args, 'use_rag') and args.use_rag else 0
+
     net_dynamics = EGNN_dynamics_QM9(
         in_node_nf=dynamics_in_node_nf, context_node_nf=args.context_node_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
         act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
+        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
+        c_nf=rag_c_nf)
 
     if args.probabilistic_model == 'diffusion':
         vdm = EnVariationalDiffusion(
@@ -45,7 +101,8 @@ def get_model(args, device, dataset_info, dataloader_train):
             include_charges=args.include_charges
             )
 
-        return vdm, nodes_dist, prop_dist
+        rag_aggregator = _create_rag_aggregator(args)
+        return vdm, nodes_dist, prop_dist, rag_aggregator
 
     else:
         raise ValueError(args.probabilistic_model)
@@ -66,6 +123,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
     print('Autoencoder models are _not_ conditioned on time.')
         # dynamics_in_node_nf = in_node_nf
     
+    rag_c_nf = args.rag_agg_dim if hasattr(args, 'use_rag') and args.use_rag else 0
     encoder = EGNN_encoder_QM9(
         in_node_nf=in_node_nf, context_node_nf=args.context_node_nf, out_node_nf=args.latent_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
@@ -73,7 +131,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges
+        include_charges=args.include_charges, c_nf=rag_c_nf
         )
     
     decoder = EGNN_decoder_QM9(
@@ -83,7 +141,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges
+        include_charges=args.include_charges, c_nf=rag_c_nf
         )
 
     vae = EnHierarchicalVAE(
@@ -97,7 +155,8 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         include_charges=args.include_charges
         )
 
-    return vae, nodes_dist, prop_dist
+    rag_aggregator = _create_rag_aggregator(args)
+    return vae, nodes_dist, prop_dist, rag_aggregator
 
 
 def get_latent_diffusion(args, device, dataset_info, dataloader_train):
@@ -114,10 +173,18 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         first_stage_args.normalization_factor = 1
     if not hasattr(first_stage_args, 'aggregation_method'):
         first_stage_args.aggregation_method = 'sum'
+    if hasattr(args, 'use_rag'):
+        first_stage_args.use_rag = args.use_rag
+    if hasattr(args, 'rag_agg_dim'):
+        first_stage_args.rag_agg_dim = args.rag_agg_dim
+    if hasattr(args, 'rag_mol_emb_dim'):
+        first_stage_args.rag_mol_emb_dim = args.rag_mol_emb_dim
+    if hasattr(args, 'rag_num_prop'):
+        first_stage_args.rag_num_prop = args.rag_num_prop
 
     device = torch.device("cuda" if first_stage_args.cuda else "cpu")
 
-    first_stage_model, nodes_dist, prop_dist = get_autoencoder(
+    first_stage_model, nodes_dist, prop_dist, rag_aggregator = get_autoencoder(
         first_stage_args, device, dataset_info, dataloader_train)
     first_stage_model.to(device)
 
@@ -137,13 +204,15 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         print('Warning: dynamics model is _not_ conditioned on time.')
         dynamics_in_node_nf = in_node_nf
 
+    rag_c_nf = args.rag_agg_dim if hasattr(args, 'use_rag') and args.use_rag else 0
     net_dynamics = EGNN_dynamics_QM9(
         in_node_nf=dynamics_in_node_nf, context_node_nf=args.context_node_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
         act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
+        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
+        c_nf=rag_c_nf)
 
     if args.probabilistic_model == 'diffusion':
         vdm = EnLatentDiffusion(
@@ -160,7 +229,7 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
             include_charges=args.include_charges
             )
 
-        return vdm, nodes_dist, prop_dist
+        return vdm, nodes_dist, prop_dist, rag_aggregator
 
     else:
         raise ValueError(args.probabilistic_model)

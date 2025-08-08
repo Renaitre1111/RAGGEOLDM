@@ -10,7 +10,8 @@ class EGNN_dynamics_QM9(nn.Module):
                  n_dims, hidden_nf=64, device='cpu',
                  act_fn=torch.nn.SiLU(), n_layers=4, attention=False,
                  condition_time=True, tanh=False, mode='egnn_dynamics', norm_constant=0,
-                 inv_sublayers=2, sin_embedding=False, normalization_factor=100, aggregation_method='sum'):
+                 inv_sublayers=2, sin_embedding=False, normalization_factor=100, aggregation_method='sum',
+                 rag_c_nf=0):
         super().__init__()
         self.mode = mode
         if mode == 'egnn_dynamics':
@@ -20,7 +21,7 @@ class EGNN_dynamics_QM9(nn.Module):
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
                 normalization_factor=normalization_factor,
-                aggregation_method=aggregation_method)
+                aggregation_method=aggregation_method, c_nf=rag_c_nf)
             self.in_node_nf = in_node_nf
         elif mode == 'gnn_dynamics':
             self.gnn = GNN(
@@ -38,15 +39,15 @@ class EGNN_dynamics_QM9(nn.Module):
     def forward(self, t, xh, node_mask, edge_mask, context=None):
         raise NotImplementedError
 
-    def wrap_forward(self, node_mask, edge_mask, context):
+    def wrap_forward(self, node_mask, edge_mask, context, adaln_ctx=None):
         def fwd(time, state):
-            return self._forward(time, state, node_mask, edge_mask, context)
+            return self._forward(time, state, node_mask, edge_mask, context, adaln_ctx)
         return fwd
 
     def unwrap_forward(self):
         return self._forward
 
-    def _forward(self, t, xh, node_mask, edge_mask, context):
+    def _forward(self, t, xh, node_mask, edge_mask, context, adaln_ctx=None):
         bs, n_nodes, dims = xh.shape
         h_dims = dims - self.n_dims
         edges = self.get_adj_matrix(n_nodes, bs, self.device)
@@ -75,8 +76,13 @@ class EGNN_dynamics_QM9(nn.Module):
             context = context.view(bs*n_nodes, self.context_node_nf)
             h = torch.cat([h, context], dim=1)
 
+        if adaln_ctx is not None:
+            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+        else:
+            adaln_ctx = None
+
         if self.mode == 'egnn_dynamics':
-            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask)
+            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask, adaln_ctx=adaln_ctx)
             vel = (x_final - x) * node_mask  # This masking operation is redundant but just in case
         elif self.mode == 'gnn_dynamics':
             xh = torch.cat([x, h], dim=1)
@@ -140,7 +146,7 @@ class EGNN_encoder_QM9(nn.Module):
                  act_fn=torch.nn.SiLU(), n_layers=4, attention=False,
                  tanh=False, mode='egnn_dynamics', norm_constant=0,
                  inv_sublayers=2, sin_embedding=False, normalization_factor=100, aggregation_method='sum',
-                 include_charges=True):
+                 include_charges=True, rag_c_nf=0):
         '''
         :param in_node_nf: Number of invariant features for input nodes.'''
         super().__init__()
@@ -156,7 +162,7 @@ class EGNN_encoder_QM9(nn.Module):
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
                 normalization_factor=normalization_factor,
-                aggregation_method=aggregation_method)
+                aggregation_method=aggregation_method, c_nf=rag_c_nf)
             self.in_node_nf = in_node_nf
         elif mode == 'gnn_dynamics':
             self.gnn = GNN(
@@ -183,15 +189,15 @@ class EGNN_encoder_QM9(nn.Module):
     def forward(self, t, xh, node_mask, edge_mask, context=None):
         raise NotImplementedError
 
-    def wrap_forward(self, node_mask, edge_mask, context):
+    def wrap_forward(self, node_mask, edge_mask, context, adaln_ctx=None):
         def fwd(time, state):
-            return self._forward(time, state, node_mask, edge_mask, context)
+            return self._forward(time, state, node_mask, edge_mask, context, adaln_ctx)
         return fwd
 
     def unwrap_forward(self):
         return self._forward
 
-    def _forward(self, xh, node_mask, edge_mask, context):      
+    def _forward(self, xh, node_mask, edge_mask, context, adaln_ctx=None):      
         bs, n_nodes, dims = xh.shape
         h_dims = dims - self.n_dims
         edges = self.get_adj_matrix(n_nodes, bs, self.device)
@@ -209,9 +215,14 @@ class EGNN_encoder_QM9(nn.Module):
             # We're conditioning, awesome!
             context = context.view(bs*n_nodes, self.context_node_nf)
             h = torch.cat([h, context], dim=1)
-
+        
+        if adaln_ctx is not None:
+            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+        else:
+            adaln_ctx = None
+        
         if self.mode == 'egnn_dynamics':
-            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask)
+            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask, adaln_ctx=adaln_ctx)
             vel = x_final * node_mask  # This masking operation is redundant but just in case
         elif self.mode == 'gnn_dynamics':
             xh = torch.cat([x, h], dim=1)
@@ -290,7 +301,7 @@ class EGNN_decoder_QM9(nn.Module):
                  act_fn=torch.nn.SiLU(), n_layers=4, attention=False,
                  tanh=False, mode='egnn_dynamics', norm_constant=0,
                  inv_sublayers=2, sin_embedding=False, normalization_factor=100, aggregation_method='sum',
-                 include_charges=True):
+                 include_charges=True, rag_c_nf=0):
         super().__init__()
 
         include_charges = int(include_charges)
@@ -304,7 +315,7 @@ class EGNN_decoder_QM9(nn.Module):
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
                 normalization_factor=normalization_factor,
-                aggregation_method=aggregation_method)
+                aggregation_method=aggregation_method, c_nf=rag_c_nf)
             self.in_node_nf = in_node_nf
         elif mode == 'gnn_dynamics':
             self.gnn = GNN(
@@ -324,15 +335,15 @@ class EGNN_decoder_QM9(nn.Module):
     def forward(self, t, xh, node_mask, edge_mask, context=None):
         raise NotImplementedError
 
-    def wrap_forward(self, node_mask, edge_mask, context):
+    def wrap_forward(self, node_mask, edge_mask, context, adaln_ctx=None):
         def fwd(time, state):
-            return self._forward(time, state, node_mask, edge_mask, context)
+            return self._forward(time, state, node_mask, edge_mask, context, adaln_ctx)
         return fwd
 
     def unwrap_forward(self):
         return self._forward
 
-    def _forward(self, xh, node_mask, edge_mask, context):
+    def _forward(self, xh, node_mask, edge_mask, context, adaln_ctx=None):
         bs, n_nodes, dims = xh.shape
         h_dims = dims - self.n_dims
         edges = self.get_adj_matrix(n_nodes, bs, self.device)
@@ -350,9 +361,14 @@ class EGNN_decoder_QM9(nn.Module):
             # We're conditioning, awesome!
             context = context.view(bs*n_nodes, self.context_node_nf)
             h = torch.cat([h, context], dim=1)
-
+        
+        if adaln_ctx is not None:
+            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+        else:
+            adaln_ctx = None
+        
         if self.mode == 'egnn_dynamics':
-            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask)
+            h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask, adaln_ctx=adaln_ctx)
             vel = x_final * node_mask  # This masking operation is redundant but just in case
         elif self.mode == 'gnn_dynamics':
             xh = torch.cat([x, h], dim=1)

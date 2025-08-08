@@ -84,7 +84,18 @@ def prepare_context(conditioning, minibatch, property_norms):
     # Concatenate
     context = torch.cat(context_list, dim=2)
     # Mask disabled nodes!
-    context = context * node_mask
+    context = context * node_mask # (bs, n_nodes, context_node_nf)
     assert context.size(2) == context_node_nf
     return context
 
+def unnormalize_context(norm_context, conditioning, property_norms):
+    unnorm_props = []
+    for i, key in enumerate(conditioning):
+        norm_val = norm_context[:, :, i]
+
+        mean = property_norms[key]['mean'].to(norm_context.device)
+        mad = property_norms[key]['mad'].to(norm_context.device)
+        unnorm_val = norm_val * mad + mean
+        unnorm_props.append(unnorm_val)
+    unnorm_props = torch.cat(unnorm_props, dim=2) # (bs, n_nodes, num_props)
+    return unnorm_props
