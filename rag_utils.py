@@ -58,7 +58,6 @@ class MolRAG:
             emb_model_params['batch_size'] = args.batch_size_chemberta
         elif hasattr(args, 'batch_size'):
             emb_model_params['batch_size'] = args.batch_size
-        print(f"DEBUG: emb_model_params for ChemBERTa: {emb_model_params}")
         self.emb_model = _create_emb_model(emb_model_params)
         self.smi_list = None
         self.property = None
