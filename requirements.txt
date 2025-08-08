@@ -10,6 +10,7 @@ transformers==4.38.0
 torch==2.1.2+cu121
 torchvision==0.16.2+cu121
 tqdm==4.64.1
+rdkit==2025.3.5
 requests==2.31.0
 ipykernel==6.28.0
 jupyterlab==4.0.10
