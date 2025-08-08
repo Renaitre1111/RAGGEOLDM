@@ -176,12 +176,12 @@ def main_quantitative(args):
 def save_and_sample_conditional(args, device, model, prop_dist, dataset_info, epoch=0, id_from=0):
     one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model, dataset_info, prop_dist)
 
-    vis.save_xyz_file(
-        'outputs/%s/analysis/run%s/' % (args.exp_name, epoch), one_hot, charges, x, dataset_info,
-        id_from, name='conditional', node_mask=node_mask)
+    # vis.save_xyz_file(
+    #     'outputs/%s/analysis/run%s/' % (args.exp_name, epoch), one_hot, charges, x, dataset_info,
+    #     id_from, name='conditional', node_mask=node_mask)
 
-    vis.visualize_chain("outputs/%s/analysis/run%s/" % (args.exp_name, epoch), dataset_info,
-                        wandb=None, mode='conditional', spheres_3d=True)
+    # vis.visualize_chain("outputs/%s/analysis/run%s/" % (args.exp_name, epoch), dataset_info,
+    #                     wandb=None, mode='conditional', spheres_3d=True)
 
     return one_hot, charges, x
 
