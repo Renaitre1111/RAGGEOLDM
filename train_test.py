@@ -11,11 +11,11 @@ import qm9.utils as qm9utils
 from qm9 import losses
 import time
 import torch
+import torch.distributed as dist
 
 
-def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dtype, property_norms, optim,
+def train_epoch(args, loader, epoch, model, model_ema, ema, device, dtype, property_norms, optim,
                 nodes_dist, gradnorm_queue, dataset_info, prop_dist, rag_aggregator=None, rag_db=None, writer=None, global_step=0): # Removed scaler 参数
-    model_dp.train()
     model.train()
     nll_epoch = []
     n_iterations = len(loader)
@@ -68,7 +68,7 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
 
         # Removed: with autocast(enabled=args.use_amp):
         # transform batch through flow
-        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model_dp, nodes_dist,
+        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model, nodes_dist,
                                                                 x, h, node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
         # standard nll from forward KL
         loss = nll + args.ode_regularization * reg_term
@@ -89,42 +89,50 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
 
         # Update EMA if enabled.
         if args.ema_decay > 0:
-            ema.update_model_average(model_ema, model)
+            ema.update_model_average(model_ema, model.module if args.world_size > 1 else model)
 
         current_global_step = global_step + i 
 
-        if i % args.n_report_steps == 0:
-            print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
-                  f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
-                  f"RegTerm: {reg_term.item():.1f}, "
-                  f"GradNorm: {grad_norm:.1f}")
         nll_epoch.append(nll.item())
+        
+        if args.rank == 0:
+            if i % args.n_report_steps == 0:
+                print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
+                    f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
+                    f"RegTerm: {reg_term.item():.1f}, "
+                    f"GradNorm: {grad_norm:.1f}")
 
-        if writer:
-            writer.add_scalar("NLL/Train_Batch", nll.item(), global_step=current_global_step)
+            if writer:
+                writer.add_scalar("NLL/Train_Batch", nll.item(), global_step=current_global_step)
 
-        if (epoch % args.test_epochs == 0) and (i % args.visualize_every_batch == 0) and not (epoch == 0 and i == 0) and args.train_diffusion:
-            start = time.time()
-            if len(args.conditioning) > 0:
-                save_and_sample_conditional(args, device, model_ema, prop_dist, dataset_info, epoch=epoch, 
-                                            rag_aggregator=rag_aggregator, rag_db=rag_db)
-            save_and_sample_chain(model_ema, args, device, dataset_info, prop_dist, epoch=epoch,
-                                  batch_id=str(i), rag_aggregator=rag_aggregator, rag_db=rag_db)
-            sample_different_sizes_and_save(model_ema, nodes_dist, args, device, dataset_info,
-                                            prop_dist, epoch=epoch, rag_aggregator=rag_aggregator, rag_db=rag_db)
-            print(f'Sampling took {time.time() - start:.2f} seconds')
+            if (epoch % args.test_epochs == 0) and (i % args.visualize_every_batch == 0) and not (epoch == 0 and i == 0) and args.train_diffusion:
+                start = time.time()
+                if len(args.conditioning) > 0:
+                    save_and_sample_conditional(args, device, model_ema, prop_dist, dataset_info, epoch=epoch, 
+                                                rag_aggregator=rag_aggregator, rag_db=rag_db)
+                save_and_sample_chain(model_ema, args, device, dataset_info, prop_dist, epoch=epoch,
+                                    batch_id=str(i), rag_aggregator=rag_aggregator, rag_db=rag_db)
+                sample_different_sizes_and_save(model_ema, nodes_dist, args, device, dataset_info,
+                                                prop_dist, epoch=epoch, rag_aggregator=rag_aggregator, rag_db=rag_db)
+                print(f'Sampling took {time.time() - start:.2f} seconds')
 
-            # vis.visualize(f"outputs/{args.exp_name}/epoch_{epoch}_{i}", dataset_info=dataset_info, wandb=wandb)
-            # vis.visualize_chain(f"outputs/{args.exp_name}/epoch_{epoch}_{i}/chain/", dataset_info, wandb=wandb)
-            # if len(args.conditioning) > 0:
-                # vis.visualize_chain("outputs/%s/epoch_%d/conditional/" % (args.exp_name, epoch), dataset_info,
-                #                     wandb=wandb, mode='conditional')
-        wandb.log({"Batch NLL": nll.item()}, commit=True)
         if args.break_train_epoch:
             break
-    wandb.log({"Train Epoch NLL": np.mean(nll_epoch)}, commit=False)
-    if writer:
-        writer.add_scalar("NLL/Train_Epoch", np.mean(nll_epoch), global_step=epoch)
+    
+    if args.world_size > 1:
+        nll_epoch = torch.tensor(nll_epoch, device=device, dtype=dtype)
+        gathered_nll_epoch = [torch.zeros_like(nll_epoch) for _ in range(args.world_size)]
+        dist.all_gather(gathered_nll_epoch, nll_epoch)
+        all_nlls = torch.cat(gathered_nll_epoch).cpu().numpy()
+        mean_nll = np.mean(all_nlls)
+    else:
+        mean_nll = np.mean(nll_epoch)
+
+    if args.rank == 0:
+        wandb.log({"Train Epoch NLL": mean_nll}, commit=False)
+        if writer:
+            writer.add_scalar("NLL/Train_Epoch", mean_nll, global_step=epoch)
+
 
 def check_mask_correct(variables, node_mask):
     for i, variable in enumerate(variables):
@@ -194,51 +202,68 @@ def test(args, loader, epoch, eval_model, device, dtype, property_norms, nodes_d
 
             nll_epoch += nll.item() * batch_size
             n_samples += batch_size
-            if i % args.n_report_steps == 0:
-                print(f"\r {partition} NLL \t epoch: {epoch}, iter: {i}/{n_iterations}, "
-                      f"NLL: {nll_epoch/n_samples:.2f}")
-        if writer:
-            writer.add_scalar(f"NLL/{partition}_Epoch", nll_epoch/n_samples, global_step=epoch)
+            if args.rank == 0:
+                if i % args.n_report_steps == 0:
+                    print(f"\r {partition} NLL \t epoch: {epoch}, iter: {i}/{n_iterations}, "
+                        f"NLL: {nll_epoch/n_samples:.2f}")
+        if args.world_size > 1:
+            # Convert accumulated NLL and samples to tensors
+            total_nll = torch.tensor(nll_epoch, device=device, dtype=dtype)
+            total_samples = torch.tensor(n_samples, device=device, dtype=torch.int)
 
-    return nll_epoch/n_samples
+            # Reduce sum across all processes
+            dist.all_reduce(total_nll, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
+
+            # Compute global mean NLL
+            global_mean_nll = total_nll.item() / total_samples.item()
+        else:
+            global_mean_nll = nll_epoch / n_samples
+
+        if args.rank == 0:
+            if writer:
+                writer.add_scalar(f"NLL/{partition}_Epoch", global_mean_nll, global_step=epoch)
+
+    return global_mean_nll
 
 
 def save_and_sample_chain(model, args, device, dataset_info, prop_dist,
                           epoch=0, id_from=0, batch_id='', rag_aggregator=None, rag_db=None):
-    # Removed: with autocast(enabled=args.use_amp):
-    one_hot, charges, x = sample_chain(args=args, device=device, flow=model,
+    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    one_hot, charges, x = sample_chain(args=args, device=device, flow=model_unwrapped,
                                        n_tries=1, dataset_info=dataset_info, prop_dist=prop_dist,
                                        rag_aggregator=rag_aggregator, rag_db=rag_db)
-    # ... (rest of the function)
-    # vis.save_xyz_file(...)
     return one_hot, charges, x
 
 
 def sample_different_sizes_and_save(model, nodes_dist, args, device, dataset_info, prop_dist,
                                     n_samples=5, epoch=0, batch_size=100, batch_id='', rag_aggregator=None, rag_db=None):
+    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    
     batch_size = min(batch_size, n_samples)
     for counter in range(int(n_samples/batch_size)):
         # Removed: with autocast(enabled=args.use_amp):
         nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model, prop_dist=prop_dist,
+        one_hot, charges, x, node_mask = sample(args, device, model_unwrapped, prop_dist=prop_dist,
                                                 nodesxsample=nodesxsample,
                                                 dataset_info=dataset_info,
                                                 rag_aggregator=rag_aggregator, rag_db=rag_db)
-        # ... (rest of the function)
+        
         print(f"Generated molecule: Positions {x[:-1, :, :]}")
-        # vis.save_xyz_file(...)
 
 
 def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info, prop_dist,
                      n_samples=1000, batch_size=100, rag_aggregator=None, rag_db=None):
     print(f'Analyzing molecule stability at epoch {epoch}...')
+    model_unwrapped = model_sample.module if isinstance(model_sample, torch.nn.parallel.DistributedDataParallel) else model_sample
+
     batch_size = min(batch_size, n_samples)
     assert n_samples % batch_size == 0
     molecules = {'one_hot': [], 'x': [], 'node_mask': []}
     for i in range(int(n_samples/batch_size)):
         # Removed: with autocast(enabled=args.use_amp):
         nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model_sample, dataset_info, prop_dist,
+        one_hot, charges, x, node_mask = sample(args, device, model_unwrapped, dataset_info, prop_dist,
                                                 nodesxsample=nodesxsample, rag_aggregator=rag_aggregator, rag_db=rag_db)
 
         molecules['one_hot'].append(one_hot.detach().cpu())
@@ -256,11 +281,8 @@ def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info
 
 def save_and_sample_conditional(args, device, model, prop_dist, dataset_info, epoch=0, id_from=0,
                                 rag_aggregator=None, rag_db=None):
-    # Removed: with autocast(enabled=args.use_amp):
-    one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model, dataset_info, prop_dist,
+    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model_unwrapped, dataset_info, prop_dist,
                                                                rag_aggregator=rag_aggregator, rag_db=rag_db)
-
-    # ... (rest of the function)
-    # vis.save_xyz_file(...)
 
     return one_hot, charges, x

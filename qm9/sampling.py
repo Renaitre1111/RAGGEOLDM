@@ -5,6 +5,7 @@ from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_
     assert_correctly_masked
 from qm9.analyze import check_stability
 import qm9.utils as qm9utils
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 def rotate_chain(z):
     assert z.size(0) == 1
@@ -52,7 +53,8 @@ def reverse_tensor(x):
 
 
 def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None, rag_aggregator=None, rag_db=None):
-    # Removed: with autocast(enabled=args.use_amp):
+    flow = flow.module if isinstance(flow, DDP) else flow
+
     n_samples = 1
     if args.dataset == 'qm9' or args.dataset == 'qm9_second_half' or args.dataset == 'qm9_first_half':
         n_nodes = 19
@@ -132,7 +134,8 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None, rag_
 def sample(args, device, generative_model, dataset_info,
            prop_dist=None, nodesxsample=torch.tensor([10]), context=None,
            fix_noise=False, rag_aggregator=None, rag_db=None):
-    # Removed: with autocast(enabled=args.use_amp):
+    generative_model = generative_model.module if isinstance(generative_model, DDP) else generative_model
+
     max_n_nodes = dataset_info['max_n_nodes']  # this is the maximum node_size in QM9
 
     assert int(torch.max(nodesxsample)) <= max_n_nodes
@@ -199,7 +202,8 @@ def sample(args, device, generative_model, dataset_info,
 
 
 def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_dist, n_nodes=19, n_frames=100, rag_aggregator=None, rag_db=None):
-    # Removed: with autocast(enabled=args.use_amp):
+    generative_model = generative_model.module if isinstance(generative_model, DDP) else generative_model
+    
     nodesxsample = torch.tensor([n_nodes] * n_frames)
 
     context = []
