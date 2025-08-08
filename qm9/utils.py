@@ -96,6 +96,7 @@ def unnormalize_context(norm_context, conditioning, property_norms):
         mean = property_norms[key]['mean'].to(norm_context.device)
         mad = property_norms[key]['mad'].to(norm_context.device)
         unnorm_val = norm_val * mad + mean
+        unnorm_val = unnorm_val.unsqueeze(2)
         unnorm_props.append(unnorm_val)
     unnorm_props = torch.cat(unnorm_props, dim=2) # (bs, n_nodes, num_props)
     return unnorm_props

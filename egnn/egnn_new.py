@@ -55,7 +55,7 @@ class GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
         
-        self.noda_adaln = AdaLNLayer(output_nf, c_nf)
+        self.node_adaln = AdaLNLayer(output_nf, c_nf)
 
         if self.attention:
             self.att_mlp = nn.Sequential(
@@ -95,7 +95,11 @@ class GCL(nn.Module):
 
     def forward(self, h, edge_index, edge_attr=None, node_attr=None, node_mask=None, edge_mask=None, adaln_ctx=None):
         row, col = edge_index
-        edge_feat, mij = self.edge_model(h[row], h[col], edge_attr, edge_mask, adaln_ctx)
+        if adaln_ctx is not None:
+            edge_adaln_ctx = adaln_ctx[row] 
+        else:
+            edge_adaln_ctx = None
+        edge_feat, mij = self.edge_model(h[row], h[col], edge_attr, edge_mask, edge_adaln_ctx)
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr, adaln_ctx)
         if node_mask is not None:
             h = h * node_mask
@@ -186,9 +190,14 @@ class EquivariantBlock(nn.Module):
         if self.sin_embedding is not None:
             distances = self.sin_embedding(distances)
         edge_attr = torch.cat([distances, edge_attr], dim=1)
+        row, col = edge_index
         for i in range(0, self.n_layers):
             h, _ = self._modules["gcl_%d" % i](h, edge_index, edge_attr=edge_attr, node_mask=node_mask, edge_mask=edge_mask, adaln_ctx=adaln_ctx)
-        x = self._modules["gcl_equiv"](h, x, edge_index, coord_diff, edge_attr, node_mask, edge_mask, adaln_ctx)
+        if adaln_ctx is not None:
+            adaln_ctx_update = adaln_ctx[row]
+        else:
+            adaln_ctx_update = None
+        x = self._modules["gcl_equiv"](h, x, edge_index, coord_diff, edge_attr, node_mask, edge_mask, adaln_ctx_update)
 
         # Important, the bias of the last linear might be non-zero
         if node_mask is not None:

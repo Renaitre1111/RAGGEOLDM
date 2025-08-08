@@ -86,7 +86,7 @@ def get_model(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        c_nf=rag_c_nf)
+        rag_c_nf=rag_c_nf)
 
     if args.probabilistic_model == 'diffusion':
         vdm = EnVariationalDiffusion(
@@ -131,7 +131,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges, c_nf=rag_c_nf
+        include_charges=args.include_charges, rag_c_nf=rag_c_nf
         )
     
     decoder = EGNN_decoder_QM9(
@@ -141,7 +141,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges, c_nf=rag_c_nf
+        include_charges=args.include_charges, rag_c_nf=rag_c_nf
         )
 
     vae = EnHierarchicalVAE(
@@ -212,7 +212,7 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        c_nf=rag_c_nf)
+        rag_c_nf=rag_c_nf)
 
     if args.probabilistic_model == 'diffusion':
         vdm = EnLatentDiffusion(

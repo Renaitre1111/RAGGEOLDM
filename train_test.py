@@ -1,3 +1,4 @@
+# train_test.py
 import wandb
 from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked, sample_center_gravity_zero_gaussian_with_mask
@@ -11,9 +12,11 @@ from qm9 import losses
 import time
 import torch
 
+from torch.cuda.amp import autocast, GradScaler
+
 
 def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dtype, property_norms, optim,
-                nodes_dist, gradnorm_queue, dataset_info, prop_dist, rag_aggregator=None, rag_db=None, writer=None, global_step=0):
+                nodes_dist, gradnorm_queue, dataset_info, prop_dist, rag_aggregator=None, rag_db=None, writer=None, global_step=0, scaler=None): # 新增 scaler 参数
     model_dp.train()
     model.train()
     nll_epoch = []
@@ -48,35 +51,47 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
 
         adaln_ctx = None
         if args.use_rag:
-            target_norm = context[:, 0, :] # (bs, num_props)
-            target_unnorm = qm9utils.unnormalize_context(context, args.conditioning, property_norms)
-
-            target_unnorm_ret = target_unnorm[:, 0, :].cpu().numpy() # (bs, num_props)
+            # Note: For AMP, ensure these are already on device and correct dtype (float32 is fine, autocast handles it)
+            target_norm_raw = context[:, :1, :].squeeze(1) # context is (bs, n_nodes, num_props), this becomes (bs, num_props)
+            # target_unnorm is not used in the model forward, so its dtype doesn't directly impact AMP here.
+            target_unnorm_ret = qm9utils.unnormalize_context(context[:, :1, :], args.conditioning, property_norms)[:, 0, :].cpu().numpy()
             ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
             
             ret_mol_embs = torch.from_numpy(ret_mol_embs).to(device, dtype)
             ret_prop_vals = torch.from_numpy(ret_prop_vals).to(device, dtype)
             ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype)
 
-            adaln_ctx = rag_aggregator(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
+            # Pass the raw target_norm for RAGAggregator as it expects (bs, num_props)
+            adaln_ctx = rag_aggregator(target_norm_raw, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
 
             adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, x.size(1), 1) * node_mask  # (bs, n_nodes, agg_dim)
 
         optim.zero_grad()
 
-        # transform batch through flow
-        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model_dp, nodes_dist,
-                                                                x, h, node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
-        # standard nll from forward KL
-        loss = nll + args.ode_regularization * reg_term
-        loss.backward()
+        with autocast(enabled=args.use_amp):
+            # transform batch through flow
+            nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model_dp, nodes_dist,
+                                                                    x, h, node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
+            # standard nll from forward KL
+            loss = nll + args.ode_regularization * reg_term
+        
+        if args.use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if args.clip_grad:
+            if args.use_amp:
+                scaler.unscale_(optim)
             grad_norm = utils.gradient_clipping(model, gradnorm_queue)
         else:
             grad_norm = 0.
 
-        optim.step()
+        if args.use_amp:
+            scaler.step(optim)
+            scaler.update()
+        else:
+            optim.step()
 
         # Update EMA if enabled.
         if args.ema_decay > 0:
@@ -161,24 +176,27 @@ def test(args, loader, epoch, eval_model, device, dtype, property_norms, nodes_d
             adaln_ctx = None
 
             if args.use_rag:
-                target_norm = context[:, 0, :] # (bs, 1, num_props)
-                target_unnorm = qm9utils.unnormalize_context(context, args.conditioning, property_norms) # (bs, n_nodes, num_props)
-
-                target_unnorm_ret = target_unnorm[:, 0, :].cpu().numpy() # (bs, num_props)
+                # Note: For AMP, ensure these are already on device and correct dtype (float32 is fine, autocast handles it)
+                target_norm_raw = context[:, :1, :].squeeze(1) # context is (bs, n_nodes, num_props), this becomes (bs, num_props)
+                # target_unnorm is not used in the model forward, so its dtype doesn't directly impact AMP here.
+                target_unnorm_ret = qm9utils.unnormalize_context(context[:, :1, :], args.conditioning, property_norms)[:, 0, :].cpu().numpy()
                 ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
                 
                 ret_mol_embs = torch.from_numpy(ret_mol_embs).to(device, dtype)
                 ret_prop_vals = torch.from_numpy(ret_prop_vals).to(device, dtype)
                 ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype)
 
-                adaln_ctx = rag_aggregator.aggregate(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
+                # Pass the raw target_norm for RAGAggregator as it expects (bs, num_props)
+                # `aggregate` method is used here, ensure it has the same signature
+                adaln_ctx = rag_aggregator(target_norm_raw, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
 
                 adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, x.size(1), 1) * node_mask  # (bs, n_nodes, agg_dim)
 
-            # transform batch through flow
-            nll, _, _ = losses.compute_loss_and_nll(args, eval_model, nodes_dist, x, h,
-                                                    node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
-            # standard nll from forward KL
+            with autocast(enabled=args.use_amp):
+                # transform batch through flow
+                nll, _, _ = losses.compute_loss_and_nll(args, eval_model, nodes_dist, x, h,
+                                                        node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
+                # standard nll from forward KL
 
             nll_epoch += nll.item() * batch_size
             n_samples += batch_size
@@ -193,13 +211,12 @@ def test(args, loader, epoch, eval_model, device, dtype, property_norms, nodes_d
 
 def save_and_sample_chain(model, args, device, dataset_info, prop_dist,
                           epoch=0, id_from=0, batch_id='', rag_aggregator=None, rag_db=None):
-    one_hot, charges, x = sample_chain(args=args, device=device, flow=model,
-                                       n_tries=1, dataset_info=dataset_info, prop_dist=prop_dist,
-                                       rag_aggregator=rag_aggregator, rag_db=rag_db)
-
-    # vis.save_xyz_file(f'outputs/{args.exp_name}/epoch_{epoch}_{batch_id}/chain/',
-    #                   one_hot, charges, x, dataset_info, id_from, name='chain')
-
+    with autocast(enabled=args.use_amp):
+        one_hot, charges, x = sample_chain(args=args, device=device, flow=model,
+                                           n_tries=1, dataset_info=dataset_info, prop_dist=prop_dist,
+                                           rag_aggregator=rag_aggregator, rag_db=rag_db)
+    # ... (rest of the function)
+    # vis.save_xyz_file(...)
     return one_hot, charges, x
 
 
@@ -207,14 +224,15 @@ def sample_different_sizes_and_save(model, nodes_dist, args, device, dataset_inf
                                     n_samples=5, epoch=0, batch_size=100, batch_id='', rag_aggregator=None, rag_db=None):
     batch_size = min(batch_size, n_samples)
     for counter in range(int(n_samples/batch_size)):
-        nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model, prop_dist=prop_dist,
-                                                nodesxsample=nodesxsample,
-                                                dataset_info=dataset_info,
-                                                rag_aggregator=rag_aggregator, rag_db=rag_db)
+        with autocast(enabled=args.use_amp):
+            nodesxsample = nodes_dist.sample(batch_size)
+            one_hot, charges, x, node_mask = sample(args, device, model, prop_dist=prop_dist,
+                                                    nodesxsample=nodesxsample,
+                                                    dataset_info=dataset_info,
+                                                    rag_aggregator=rag_aggregator, rag_db=rag_db)
+        # ... (rest of the function)
         print(f"Generated molecule: Positions {x[:-1, :, :]}")
-        # vis.save_xyz_file(f'outputs/{args.exp_name}/epoch_{epoch}_{batch_id}/', one_hot, charges, x, dataset_info,
-        #                  batch_size * counter, name='molecule')
+        # vis.save_xyz_file(...)
 
 
 def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info, prop_dist,
@@ -224,9 +242,10 @@ def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info
     assert n_samples % batch_size == 0
     molecules = {'one_hot': [], 'x': [], 'node_mask': []}
     for i in range(int(n_samples/batch_size)):
-        nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model_sample, dataset_info, prop_dist,
-                                                nodesxsample=nodesxsample, rag_aggregator=rag_aggregator, rag_db=rag_db)
+        with autocast(enabled=args.use_amp):
+            nodesxsample = nodes_dist.sample(batch_size)
+            one_hot, charges, x, node_mask = sample(args, device, model_sample, dataset_info, prop_dist,
+                                                    nodesxsample=nodesxsample, rag_aggregator=rag_aggregator, rag_db=rag_db)
 
         molecules['one_hot'].append(one_hot.detach().cpu())
         molecules['x'].append(x.detach().cpu())
@@ -243,11 +262,12 @@ def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info
 
 def save_and_sample_conditional(args, device, model, prop_dist, dataset_info, epoch=0, id_from=0,
                                 rag_aggregator=None, rag_db=None):
-    one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model, dataset_info, prop_dist,
-                                                               rag_aggregator=rag_aggregator, rag_db=rag_db)
+    with autocast(enabled=args.use_amp):
+        one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model, dataset_info, prop_dist,
+                                                                   rag_aggregator=rag_aggregator, rag_db=rag_db)
 
-    # vis.save_xyz_file(
-    #     'outputs/%s/epoch_%d/conditional/' % (args.exp_name, epoch), one_hot, charges, x, dataset_info,
-    #     id_from, name='conditional', node_mask=node_mask)
+    # ... (rest of the function)
+    # vis.save_xyz_file(...)
 
     return one_hot, charges, x
+

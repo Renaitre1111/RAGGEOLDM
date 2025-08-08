@@ -21,6 +21,7 @@ from qm9.utils import prepare_context, compute_mean_mad, unnormalize_context
 from train_test import train_epoch, test, analyze_and_save
 from rag_utils import MolRAG
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 
 parser = argparse.ArgumentParser(description='E3Diffusion')
 parser.add_argument('--exp_name', type=str, default='debug_10')
@@ -141,6 +142,8 @@ parser.add_argument('--rag_num_prop', type=int, default=1, help='Number of prope
 parser.add_argument('--rag_agg_dim', type=int, default=128, help='Aggregation dimension for RAG context.')
 parser.add_argument('--batch_size_chemberta', type=int, default=32, help='Batch size for ChemBERTa embedding computation.')
 
+parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP) training')
+
 args = parser.parse_args()
 
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
@@ -242,6 +245,10 @@ else:
 
 if prop_dist is not None:
     prop_dist.set_normalizer(property_norms)
+
+if rag_aggregator is not None:
+    rag_aggregator = rag_aggregator.to(device)
+
 model = model.to(device)
 optim = get_optim(args, model)
 # print(model)
@@ -290,6 +297,7 @@ def main():
     best_epoch_val = -1
 
     global_step = args.start_epoch * len(dataloaders['train'])
+    scaler = GradScaler(enabled=args.use_amp) 
 
     for epoch in range(args.start_epoch, args.n_epochs):
         start_epoch = time.time()
@@ -298,7 +306,7 @@ def main():
                     nodes_dist=nodes_dist, dataset_info=dataset_info,
                     gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist, 
                     rag_aggregator=rag_aggregator, rag_db=rag_db,
-                    writer=writer, global_step=global_step)
+                    writer=writer, global_step=global_step, scaler=scaler)
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
 
         global_step += len(dataloaders['train']) 

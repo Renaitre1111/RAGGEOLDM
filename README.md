@@ -89,3 +89,36 @@ Please consider citing the our paper if you find it helpful. Thank you!
 ## Acknowledgements
 
 This repo is built upon the previous work [EDM](https://arxiv.org/abs/2203.17003). Thanks to the authors for their great work!
+
+python main_qm9.py \
+    --exp_name exp_cond_alpha \
+    --model egnn_dynamics \
+    --lr 1e-4 \
+    --nf 192 \
+    --n_layers 9 \
+    --save_model True \
+    --diffusion_steps 1000 \
+    --sin_embedding False \
+    --n_epochs 2100 \
+    --n_stability_samples 100 \
+    --diffusion_noise_schedule polynomial_2 \
+    --diffusion_noise_precision 1e-5 \
+    --dequantization deterministic \
+    --include_charges False \
+    --diffusion_loss_type l2 \
+    --batch_size 64 \
+    --normalize_factors [1,8,1] \
+    --conditioning alpha \
+    --dataset qm9_second_half \
+    --train_diffusion \
+    --trainable_ae \
+    --latent_nf 1 \
+    --use_rag \
+    --rag_k 8 \
+    --chemberta_path ChemBERTa \
+    --rag_mol_emb_dim 384 \
+    --rag_num_prop 1 \
+    --rag_agg_dim 128 \
+    --batch_size_chemberta 32 \
+    --no_wandb \
+    --use_amp

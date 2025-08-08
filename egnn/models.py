@@ -77,7 +77,7 @@ class EGNN_dynamics_QM9(nn.Module):
             h = torch.cat([h, context], dim=1)
 
         if adaln_ctx is not None:
-            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+            adaln_ctx = adaln_ctx.view(bs * n_nodes, -1)
         else:
             adaln_ctx = None
 
@@ -217,7 +217,7 @@ class EGNN_encoder_QM9(nn.Module):
             h = torch.cat([h, context], dim=1)
         
         if adaln_ctx is not None:
-            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+            adaln_ctx = adaln_ctx.view(bs * n_nodes, -1)
         else:
             adaln_ctx = None
         
@@ -363,7 +363,7 @@ class EGNN_decoder_QM9(nn.Module):
             h = torch.cat([h, context], dim=1)
         
         if adaln_ctx is not None:
-            adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, n_nodes, 1).view(bs * n_nodes, -1)
+            adaln_ctx = adaln_ctx.view(bs * n_nodes, -1)
         else:
             adaln_ctx = None
         

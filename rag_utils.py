@@ -46,7 +46,7 @@ class ChemBERTa(EmbeddingModel):
             return np.array([])    
         return np.concatenate(embeddings, axis=0)
 
-def _create_emb_model(name, params=None):
+def _create_emb_model(params=None):
     params = params or {}
     return ChemBERTa(**params)
     
@@ -58,6 +58,7 @@ class MolRAG:
             emb_model_params['batch_size'] = args.batch_size_chemberta
         elif hasattr(args, 'batch_size'):
             emb_model_params['batch_size'] = args.batch_size
+        print(f"DEBUG: emb_model_params for ChemBERTa: {emb_model_params}")
         self.emb_model = _create_emb_model(emb_model_params)
         self.smi_list = None
         self.property = None
@@ -159,7 +160,7 @@ class MolRAG:
                 smi_for_mol.append(self.smi_list[idx])
             retrieved_smiles_list.append(smi_for_mol)
         # (bs, k, emb_dim), (bs, k, prop), (bs, k, prop)
-        return ret_mol_embs, ret_prop_vals, ret_dist_to_targs, retrieved_smiles_list
+        return ret_mol_embs.cpu().numpy(), ret_prop_vals.cpu().numpy(), ret_dist_to_targs.cpu().numpy(), retrieved_smiles_list
     
 
     
