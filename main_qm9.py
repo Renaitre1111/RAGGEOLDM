@@ -1,3 +1,5 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Rdkit import should be first, do not move it
 try:
     from rdkit import Chem
@@ -21,18 +23,15 @@ from qm9.utils import prepare_context, compute_mean_mad, unnormalize_context
 from train_test import train_epoch, test, analyze_and_save
 from rag_utils import MolRAG
 from torch.utils.tensorboard import SummaryWriter
-import os
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 parser = argparse.ArgumentParser(description='E3Diffusion')
 parser.add_argument('--exp_name', type=str, default='debug_10')
 
-parser.add_argument('--local_rank', type=int, default=-1,
-                    help='Local rank for distributed training. Usually set by torch.distributed.launch or torchrun.')
+# --- DDP 相关参数已移除 ---
+# parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for distributed training. Usually set by torch.distributed.launch or torchrun.')
 
 # Latent Diffusion args
-parser.add_argument('--train_diffusion', action='store_true', 
+parser.add_argument('--train_diffusion', action='store_true',
                     help='Train second stage LatentDiffusionModel model')
 parser.add_argument('--ae_path', type=str, default=None,
                     help='Specify first stage model path')
@@ -154,7 +153,6 @@ parser.add_argument('--rag_agg_dim', type=int, default=128,
 parser.add_argument('--batch_size_chemberta', type=int, default=32, 
                     help='Batch size for ChemBERTa embedding computation.')
 
-
 args = parser.parse_args()
 
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
@@ -166,21 +164,7 @@ atom_decoder = dataset_info['atom_decoder']
 args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-if "LOCAL_RANK" in os.environ:
-    args.local_rank = int(os.environ["LOCAL_RANK"])
-    print(f"[{os.getpid()}] Initializing DDP with local_rank: {args.local_rank}")
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://')
-    args.world_size = dist.get_world_size()
-    args.rank = dist.get_rank()
-    device = torch.device(f'cuda:{args.local_rank}')
-    print(f"[{os.getpid()}] DDP initialized: rank {args.rank}/{args.world_size}, device {device}")
-else:
-    args.world_size = 1
-    args.rank = 0
-    device = torch.device("cuda" if args.cuda else "cpu")
-    print(f"Running without DDP: device {device}")
-
+device = torch.device("cuda" if args.cuda else "cpu")
 dtype = torch.float32
 
 if args.resume is not None:
@@ -191,17 +175,11 @@ if args.resume is not None:
     normalization_factor = args.normalization_factor
     aggregation_method = args.aggregation_method
 
-    # Store current RAG arguments to override loaded ones if they exist
     current_rag_args = {}
     for arg_name in ['use_rag', 'rag_k', 'chemberta_path', 'rag_mol_emb_dim', 'rag_num_prop', 'rag_agg_dim', 'batch_size_chemberta']:
         if hasattr(args, arg_name):
             current_rag_args[arg_name] = getattr(args, arg_name)
-    
-    current_ddp_args = {
-        'local_rank': args.local_rank,
-        'world_size': args.world_size,
-        'rank': args.rank,
-    }
+
 
     with open(join(args.resume, 'args.pickle'), 'rb') as f:
         args = pickle.load(f)
@@ -223,53 +201,24 @@ if args.resume is not None:
     for k, v in current_rag_args.items():
         setattr(args, k, v)
     
-    for k, v in current_ddp_args.items():
-        setattr(args, k, v)
-
     print(args)
 
 utils.create_folders(args)
-# print(args)
 
-
-# Wandb config
-if args.rank == 0:
-    if args.no_wandb:
-        mode = 'disabled'
-    else:
-        mode = 'online' if args.online else 'offline'
-    kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffusion_qm9', 'config': args,
-            'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
-    wandb.init(**kwargs)
-    wandb.save('*.txt')
-
-    log_dir = join('outputs', args.exp_name, 'tensorboard_logs')
-    writer = SummaryWriter(log_dir)
+if args.no_wandb:
+    mode = 'disabled'
 else:
-    writer = None
+    mode = 'online' if args.online else 'offline'
+kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffusion_qm9', 'config': args,
+            'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
+wandb.init(**kwargs)
+wandb.save('*.txt')
+
+log_dir = join('outputs', args.exp_name, 'tensorboard_logs')
+writer = SummaryWriter(log_dir)
 
 # Retrieve QM9 dataloaders
 dataloaders, charge_scale = dataset.retrieve_dataloaders(args)
-
-for partition, loader in dataloaders.items():
-    if args.world_size > 1:
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            loader.dataset,
-            num_replicas=args.world_size,
-            rank=args.rank,
-            shuffle=(partition == 'train'),
-            drop_last=True
-        )
-        # Recreate DataLoader with sampler
-        dataloaders[partition] = torch.utils.data.DataLoader(
-            loader.dataset,
-            batch_size=loader.batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=True, 
-            collate_fn=loader.collate_fn
-        )
 
 rag_db = None
 if args.use_rag:
@@ -280,6 +229,7 @@ if args.use_rag:
 
     prop_keys = args.conditioning
     rag_db.build_db(rag_dataset, prop_keys)
+
 
 if len(args.conditioning) > 0:
     print(f'Conditioning on {args.conditioning}')
@@ -318,111 +268,112 @@ def check_mask_correct(variables, node_mask):
 
 
 def main():
-    global model
-    
+
     if args.resume is not None:
-        flow_state_dict = torch.load(join(args.resume, 'flow.npy'), map_location=device)
-        optim_state_dict = torch.load(join(args.resume, 'optim.npy'), map_location=device)
+        flow_state_dict = torch.load(join(args.resume, 'flow.npy'))
+        optim_state_dict = torch.load(join(args.resume, 'optim.npy'))
         model.load_state_dict(flow_state_dict)
         optim.load_state_dict(optim_state_dict)
 
-    if args.world_size > 1:
-        model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)
+    # Initialize dataparallel if enabled and possible.
+    if args.dp and torch.cuda.device_count() > 1:
+        print(f'Training using {torch.cuda.device_count()} GPUs with DataParallel')
+        model_dp = torch.nn.DataParallel(model)
+    else:
+        model_dp = model
 
     # Initialize model copy for exponential moving average of params.
     if args.ema_decay > 0:
-        model_ema = copy.deepcopy(model.module if args.world_size > 1 else model)
-        model_ema = model_ema.to(device)
+        model_ema = copy.deepcopy(model)
         ema = flow_utils.EMA(args.ema_decay)
+
+        if args.dp and torch.cuda.device_count() > 1:
+            model_ema_dp = torch.nn.DataParallel(model_ema)
+        else:
+            model_ema_dp = model_ema
     else:
         ema = None
         model_ema = model
+        model_ema_dp = model_dp
 
     best_nll_val = 1e8
     best_nll_test = 1e8
     best_epoch_val = -1
 
     global_step = args.start_epoch * len(dataloaders['train'])
-    # Removed: scaler = GradScaler(enabled=args.use_amp) 
+
 
     for epoch in range(args.start_epoch, args.n_epochs):
         start_epoch = time.time()
-        if args.world_size > 1:
-            dataloaders['train'].sampler.set_epoch(epoch)
 
-        train_epoch(args=args, loader=dataloaders['train'], epoch=epoch, model=model,
+        train_epoch(args=args, loader=dataloaders['train'], epoch=epoch, model=model_dp,
                     model_ema=model_ema, ema=ema, device=device, dtype=dtype, property_norms=property_norms,
                     nodes_dist=nodes_dist, dataset_info=dataset_info,
-                    gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist, 
+                    gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist,
                     rag_aggregator=rag_aggregator, rag_db=rag_db,
-                    writer=writer, global_step=global_step) # Removed scaler=scaler
+                    writer=writer, global_step=global_step)
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
 
-        global_step += len(dataloaders['train']) 
+        global_step += len(dataloaders['train'])
 
-        if args.rank == 0:
-            if epoch % args.test_epochs == 0:
-                current_model = model.module if args.world_size > 1 else model
-                if isinstance(current_model, en_diffusion.EnVariationalDiffusion):
-                    wandb.log(current_model.log_info(), commit=True)
-                    if writer: writer.add_text("Model_Info", str(current_model.log_info()), global_step=epoch) # Example of logging text
+        if epoch % args.test_epochs == 0:
+            current_model = model_ema_dp.module if isinstance(model_ema_dp, torch.nn.DataParallel) else model_ema_dp
+            if isinstance(current_model, en_diffusion.EnVariationalDiffusion):
+                wandb.log(current_model.log_info(), commit=True)
+                if writer: writer.add_text("Model_Info", str(current_model.log_info()), global_step=epoch)
 
-                if not args.break_train_epoch and args.train_diffusion:
-                    analyze_and_save(args=args, epoch=epoch, model_sample=model_ema, nodes_dist=nodes_dist,
-                                    dataset_info=dataset_info, device=device,
-                                    prop_dist=prop_dist, n_samples=args.n_stability_samples, 
-                                    rag_aggregator=rag_aggregator, rag_db=rag_db)
-                nll_val = test(args=args, loader=dataloaders['valid'], epoch=epoch, eval_model=model_ema,
-                            partition='Val', device=device, dtype=dtype, 
-                            nodes_dist=nodes_dist, property_norms=property_norms, 
+            if not args.break_train_epoch and args.train_diffusion:
+                analyze_and_save(args=args, epoch=epoch, model_sample=model_ema, nodes_dist=nodes_dist,
+                                 dataset_info=dataset_info, device=device,
+                                 prop_dist=prop_dist, n_samples=args.n_stability_samples,
+                                 rag_aggregator=rag_aggregator, rag_db=rag_db)
+            
+            nll_val = test(args=args, loader=dataloaders['valid'], epoch=epoch, eval_model=model_ema_dp,
+                           partition='Val', device=device, dtype=dtype,
+                           nodes_dist=nodes_dist, property_norms=property_norms,
+                           rag_aggregator=rag_aggregator, rag_db=rag_db,
+                           writer=writer)
+            nll_test = test(args=args, loader=dataloaders['test'], epoch=epoch, eval_model=model_ema_dp,
+                            partition='Test', device=device, dtype=dtype,
+                            nodes_dist=nodes_dist, property_norms=property_norms,
                             rag_aggregator=rag_aggregator, rag_db=rag_db,
                             writer=writer)
-                nll_test = test(args=args, loader=dataloaders['test'], epoch=epoch, eval_model=model_ema,
-                                partition='Test', device=device, dtype=dtype,
-                                nodes_dist=nodes_dist, property_norms=property_norms,
-                                rag_aggregator=rag_aggregator, rag_db=rag_db,
-                                writer=writer)
-                
-                wandb.log({"Val loss ": nll_val, "epoch": epoch}, commit=True)
-                wandb.log({"Test loss ": nll_test, "epoch": epoch}, commit=True)
+            
+            wandb.log({"Val loss ": nll_val, "epoch": epoch}, commit=True)
+            wandb.log({"Test loss ": nll_test, "epoch": epoch}, commit=True)
+            if writer:
+                writer.add_scalar("NLL/Validation", nll_val, global_step=epoch)
+                writer.add_scalar("NLL/Test", nll_test, global_step=epoch)
+
+            if nll_val < best_nll_val:
+                best_nll_val = nll_val
+                best_nll_test = nll_test
+                best_epoch_val = epoch
+
                 if writer:
-                    writer.add_scalar("NLL/Validation", nll_val, global_step=epoch)
-                    writer.add_scalar("NLL/Test", nll_test, global_step=epoch)
+                    writer.add_scalar("NLL/Best_Validation", best_nll_val, global_step=epoch)
+                    writer.add_scalar("NLL/Best_Test", best_nll_test, global_step=epoch)
+                    writer.add_scalar("NLL/Best_Epoch", best_epoch_val, global_step=epoch)
 
-                if nll_val < best_nll_val:
-                    best_nll_val = nll_val
-                    best_nll_test = nll_test
-                    best_epoch_val = epoch
+                if args.save_model:
+                    args.current_epoch = epoch + 1
+                    utils.save_model(optim, 'outputs/%s/optim.npy' % args.exp_name)
+                    utils.save_model(model_dp.module if isinstance(model_dp, torch.nn.DataParallel) else model_dp,
+                                     'outputs/%s/generative_model.npy' % args.exp_name)
+                    if args.ema_decay > 0:
+                        utils.save_model(model_ema_dp.module if isinstance(model_ema_dp, torch.nn.DataParallel) else model_ema_dp,
+                                         'outputs/%s/generative_model_ema.npy' % args.exp_name)
+                    with open('outputs/%s/args.pickle' % args.exp_name, 'wb') as f:
+                        pickle.dump(args, f)
 
-                    if writer:
-                        writer.add_scalar("NLL/Best_Validation", best_nll_val, global_step=epoch)
-                        writer.add_scalar("NLL/Best_Test", best_nll_test, global_step=epoch)
-                        writer.add_scalar("NLL/Best_Epoch", best_epoch_val, global_step=epoch)
-
-                    if args.save_model:
-                        args.current_epoch = epoch + 1
-                        utils.save_model(optim, 'outputs/%s/optim.npy' % args.exp_name)
-                        # Save the unwrapped module
-                        utils.save_model(model.module if args.world_size > 1 else model, 'outputs/%s/generative_model.npy' % args.exp_name)
-                        if args.ema_decay > 0:
-                            utils.save_model(model_ema, 'outputs/%s/generative_model_ema.npy' % args.exp_name)
-                        with open('outputs/%s/args.pickle' % args.exp_name, 'wb') as f:
-                            pickle.dump(args, f)
-
-                print('Val loss: %.4f \t Test loss:  %.4f' % (nll_val, nll_test))
-                print('Best val loss: %.4f \t Best test loss:  %.4f' % (best_nll_val, best_nll_test))
-                wandb.log({"Val loss ": nll_val}, commit=True)
-                wandb.log({"Test loss ": nll_test}, commit=True)
-                wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
-        
-        if args.world_size > 1:
-            dist.barrier() 
+            print('Val loss: %.4f \t Test loss:  %.4f' % (nll_val, nll_test))
+            print('Best val loss: %.4f \t Best test loss:  %.4f' % (best_nll_val, best_nll_test))
+            wandb.log({"Val loss ": nll_val}, commit=True)
+            wandb.log({"Test loss ": nll_test}, commit=True)
+            wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
     
-    if writer and args.rank == 0:
+    if writer:
         writer.close()
-    
-    if args.world_size > 1:
-        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

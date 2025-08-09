@@ -9,13 +9,11 @@ from qm9.sampling import sample_chain, sample, sample_sweep_conditional
 import utils
 import qm9.utils as qm9utils
 from qm9 import losses
-import time
 import torch
-import torch.distributed as dist
 
 
 def train_epoch(args, loader, epoch, model, model_ema, ema, device, dtype, property_norms, optim,
-                nodes_dist, gradnorm_queue, dataset_info, prop_dist, rag_aggregator=None, rag_db=None, writer=None, global_step=0): # Removed scaler 参数
+                nodes_dist, gradnorm_queue, dataset_info, prop_dist, rag_aggregator=None, rag_db=None, writer=None, global_step=0):
     model.train()
     nll_epoch = []
     n_iterations = len(loader)
@@ -49,9 +47,7 @@ def train_epoch(args, loader, epoch, model, model_ema, ema, device, dtype, prope
 
         adaln_ctx = None
         if args.use_rag:
-            # Note: For AMP, ensure these are already on device and correct dtype (float32 is fine, autocast handles it) - AMP removed
-            target_norm_raw = context[:, :1, :].squeeze(1) # context is (bs, n_nodes, num_props), this becomes (bs, num_props)
-            # target_unnorm is not used in the model forward, so its dtype doesn't directly impact AMP here. - AMP removed
+            target_norm = context[:, :1, :].squeeze(1) # (bs, num_props)
             target_unnorm_ret = qm9utils.unnormalize_context(context[:, :1, :], args.conditioning, property_norms)[:, 0, :].cpu().numpy()
             ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
             
@@ -60,79 +56,58 @@ def train_epoch(args, loader, epoch, model, model_ema, ema, device, dtype, prope
             ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype)
 
             # Pass the raw target_norm for RAGAggregator as it expects (bs, num_props)
-            adaln_ctx = rag_aggregator(target_norm_raw, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
+            adaln_ctx = rag_aggregator(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
 
             adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, x.size(1), 1) * node_mask  # (bs, n_nodes, agg_dim)
 
         optim.zero_grad()
 
-        # Removed: with autocast(enabled=args.use_amp):
-        # transform batch through flow
-        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model, nodes_dist,
+        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(args, model, nodes_dist, # model 现在可能是 DataParallel
                                                                 x, h, node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
         # standard nll from forward KL
         loss = nll + args.ode_regularization * reg_term
         
-        # Removed: if args.use_amp: scaler.scale(loss).backward()
-        # Replaced with:
         loss.backward()
 
         if args.clip_grad:
-            # Removed: if args.use_amp: scaler.unscale_(optim)
-            grad_norm = utils.gradient_clipping(model, gradnorm_queue)
+            grad_norm = utils.gradient_clipping(model.module if isinstance(model, torch.nn.DataParallel) else model, gradnorm_queue)
         else:
             grad_norm = 0.
-
-        # Removed: if args.use_amp: scaler.step(optim); scaler.update()
-        # Replaced with:
         optim.step()
 
         # Update EMA if enabled.
         if args.ema_decay > 0:
-            ema.update_model_average(model_ema, model.module if args.world_size > 1 else model)
+            ema.update_model_average(model_ema, model.module if isinstance(model, torch.nn.DataParallel) else model)
 
         current_global_step = global_step + i 
 
+        if i % args.n_report_steps == 0:
+            print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
+                  f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
+                  f"RegTerm: {reg_term.item():.1f}, "
+                  f"GradNorm: {grad_norm:.1f}")
         nll_epoch.append(nll.item())
-        
-        if args.rank == 0:
-            if i % args.n_report_steps == 0:
-                print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
-                    f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
-                    f"RegTerm: {reg_term.item():.1f}, "
-                    f"GradNorm: {grad_norm:.1f}")
 
-            if writer:
-                writer.add_scalar("NLL/Train_Batch", nll.item(), global_step=current_global_step)
+        if writer:
+            writer.add_scalar("NLL/Train_Batch", nll.item(), global_step=current_global_step)
 
-            if (epoch % args.test_epochs == 0) and (i % args.visualize_every_batch == 0) and not (epoch == 0 and i == 0) and args.train_diffusion:
-                start = time.time()
-                if len(args.conditioning) > 0:
-                    save_and_sample_conditional(args, device, model_ema, prop_dist, dataset_info, epoch=epoch, 
-                                                rag_aggregator=rag_aggregator, rag_db=rag_db)
-                save_and_sample_chain(model_ema, args, device, dataset_info, prop_dist, epoch=epoch,
-                                    batch_id=str(i), rag_aggregator=rag_aggregator, rag_db=rag_db)
-                sample_different_sizes_and_save(model_ema, nodes_dist, args, device, dataset_info,
-                                                prop_dist, epoch=epoch, rag_aggregator=rag_aggregator, rag_db=rag_db)
-                print(f'Sampling took {time.time() - start:.2f} seconds')
+        if (epoch % args.test_epochs == 0) and (i % args.visualize_every_batch == 0) and not (epoch == 0 and i == 0) and args.train_diffusion:
+            start = time.time()
+            if len(args.conditioning) > 0:
+                save_and_sample_conditional(args, device, model_ema, prop_dist, dataset_info, epoch=epoch, 
+                                            rag_aggregator=rag_aggregator, rag_db=rag_db)
+            save_and_sample_chain(model_ema, args, device, dataset_info, prop_dist, epoch=epoch,
+                                  batch_id=str(i), rag_aggregator=rag_aggregator, rag_db=rag_db)
+            sample_different_sizes_and_save(model_ema, nodes_dist, args, device, dataset_info,
+                                            prop_dist, epoch=epoch, rag_aggregator=rag_aggregator, rag_db=rag_db)
+            print(f'Sampling took {time.time() - start:.2f} seconds')
 
+        wandb.log({"Batch NLL": nll.item()}, commit=True)
         if args.break_train_epoch:
             break
-    
-    if args.world_size > 1:
-        nll_epoch = torch.tensor(nll_epoch, device=device, dtype=dtype)
-        gathered_nll_epoch = [torch.zeros_like(nll_epoch) for _ in range(args.world_size)]
-        dist.all_gather(gathered_nll_epoch, nll_epoch)
-        all_nlls = torch.cat(gathered_nll_epoch).cpu().numpy()
-        mean_nll = np.mean(all_nlls)
-    else:
-        mean_nll = np.mean(nll_epoch)
-
-    if args.rank == 0:
-        wandb.log({"Train Epoch NLL": mean_nll}, commit=False)
-        if writer:
-            writer.add_scalar("NLL/Train_Epoch", mean_nll, global_step=epoch)
-
+    wandb.log({"Train Epoch NLL": np.mean(nll_epoch)}, commit=False)
+    if writer:
+        writer.add_scalar("NLL/Train_Epoch", np.mean(nll_epoch), global_step=epoch)
 
 def check_mask_correct(variables, node_mask):
     for i, variable in enumerate(variables):
@@ -178,73 +153,47 @@ def test(args, loader, epoch, eval_model, device, dtype, property_norms, nodes_d
             adaln_ctx = None
 
             if args.use_rag:
-                # Note: For AMP, ensure these are already on device and correct dtype (float32 is fine, autocast handles it) - AMP removed
-                target_norm_raw = context[:, :1, :].squeeze(1) # context is (bs, n_nodes, num_props), this becomes (bs, num_props)
-                # target_unnorm is not used in the model forward, so its dtype doesn't directly impact AMP here. - AMP removed
+                target_norm = context[:, :1, :].squeeze(1) 
                 target_unnorm_ret = qm9utils.unnormalize_context(context[:, :1, :], args.conditioning, property_norms)[:, 0, :].cpu().numpy()
-                ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
                 
+                ret_mol_embs, ret_prop_vals, ret_dist_to_targs, _ = rag_db.retrieve_batch(target_unnorm_ret, k=args.rag_k)
                 ret_mol_embs = torch.from_numpy(ret_mol_embs).to(device, dtype)
                 ret_prop_vals = torch.from_numpy(ret_prop_vals).to(device, dtype)
                 ret_dist_to_targs = torch.from_numpy(ret_dist_to_targs).to(device, dtype)
 
-                # Pass the raw target_norm for RAGAggregator as it expects (bs, num_props)
-                # `aggregate` method is used here, ensure it has the same signature
-                adaln_ctx = rag_aggregator(target_norm_raw, ret_mol_embs, ret_prop_vals, ret_dist_to_targs) # (bs, agg_dim)
+                adaln_ctx = rag_aggregator(target_norm, ret_mol_embs, ret_prop_vals, ret_dist_to_targs)
+                adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, x.size(1), 1) * node_mask  
+                
 
-                adaln_ctx = adaln_ctx.unsqueeze(1).repeat(1, x.size(1), 1) * node_mask  # (bs, n_nodes, agg_dim)
-
-            # Removed: with autocast(enabled=args.use_amp):
-            # transform batch through flow
             nll, _, _ = losses.compute_loss_and_nll(args, eval_model, nodes_dist, x, h,
                                                     node_mask, edge_mask, context, adaln_ctx=adaln_ctx)
-            # standard nll from forward KL
 
             nll_epoch += nll.item() * batch_size
             n_samples += batch_size
-            if args.rank == 0:
-                if i % args.n_report_steps == 0:
-                    print(f"\r {partition} NLL \t epoch: {epoch}, iter: {i}/{n_iterations}, "
-                        f"NLL: {nll_epoch/n_samples:.2f}")
-        if args.world_size > 1:
-            # Convert accumulated NLL and samples to tensors
-            total_nll = torch.tensor(nll_epoch, device=device, dtype=dtype)
-            total_samples = torch.tensor(n_samples, device=device, dtype=torch.int)
+            if i % args.n_report_steps == 0:
+                print(f"{partition} NLL \t epoch: {epoch}, iter: {i}/{n_iterations}, "
+                      f"NLL: {nll_epoch/n_samples:.4f}", flush=True)
 
-            # Reduce sum across all processes
-            dist.all_reduce(total_nll, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
+        if writer:
+            writer.add_scalar(f"NLL/{partition}_Epoch", nll_epoch/n_samples, global_step=epoch)
 
-            # Compute global mean NLL
-            global_mean_nll = total_nll.item() / total_samples.item()
-        else:
-            global_mean_nll = nll_epoch / n_samples
-
-        if args.rank == 0:
-            if writer:
-                writer.add_scalar(f"NLL/{partition}_Epoch", global_mean_nll, global_step=epoch)
-
-    return global_mean_nll
+    return nll_epoch/n_samples
 
 
 def save_and_sample_chain(model, args, device, dataset_info, prop_dist,
                           epoch=0, id_from=0, batch_id='', rag_aggregator=None, rag_db=None):
-    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    one_hot, charges, x = sample_chain(args=args, device=device, flow=model_unwrapped,
-                                       n_tries=1, dataset_info=dataset_info, prop_dist=prop_dist,
-                                       rag_aggregator=rag_aggregator, rag_db=rag_db)
+    one_hot, charges, x = sample_chain(args=args, device=device, flow=model,
+                                        n_tries=1, dataset_info=dataset_info, prop_dist=prop_dist,
+                                        rag_aggregator=rag_aggregator, rag_db=rag_db)
     return one_hot, charges, x
 
 
 def sample_different_sizes_and_save(model, nodes_dist, args, device, dataset_info, prop_dist,
                                     n_samples=5, epoch=0, batch_size=100, batch_id='', rag_aggregator=None, rag_db=None):
-    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    
     batch_size = min(batch_size, n_samples)
     for counter in range(int(n_samples/batch_size)):
-        # Removed: with autocast(enabled=args.use_amp):
         nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model_unwrapped, prop_dist=prop_dist,
+        one_hot, charges, x, node_mask = sample(args, device, model, prop_dist=prop_dist,
                                                 nodesxsample=nodesxsample,
                                                 dataset_info=dataset_info,
                                                 rag_aggregator=rag_aggregator, rag_db=rag_db)
@@ -255,15 +204,12 @@ def sample_different_sizes_and_save(model, nodes_dist, args, device, dataset_inf
 def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info, prop_dist,
                      n_samples=1000, batch_size=100, rag_aggregator=None, rag_db=None):
     print(f'Analyzing molecule stability at epoch {epoch}...')
-    model_unwrapped = model_sample.module if isinstance(model_sample, torch.nn.parallel.DistributedDataParallel) else model_sample
-
     batch_size = min(batch_size, n_samples)
     assert n_samples % batch_size == 0
     molecules = {'one_hot': [], 'x': [], 'node_mask': []}
     for i in range(int(n_samples/batch_size)):
-        # Removed: with autocast(enabled=args.use_amp):
         nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, node_mask = sample(args, device, model_unwrapped, dataset_info, prop_dist,
+        one_hot, charges, x, node_mask = sample(args, device, model_sample, dataset_info, prop_dist,
                                                 nodesxsample=nodesxsample, rag_aggregator=rag_aggregator, rag_db=rag_db)
 
         molecules['one_hot'].append(one_hot.detach().cpu())
@@ -281,8 +227,7 @@ def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info
 
 def save_and_sample_conditional(args, device, model, prop_dist, dataset_info, epoch=0, id_from=0,
                                 rag_aggregator=None, rag_db=None):
-    model_unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model_unwrapped, dataset_info, prop_dist,
-                                                               rag_aggregator=rag_aggregator, rag_db=rag_db)
+    one_hot, charges, x, node_mask = sample_sweep_conditional(args, device, model, dataset_info, prop_dist,
+                                                                rag_aggregator=rag_aggregator, rag_db=rag_db)
 
     return one_hot, charges, x
