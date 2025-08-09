@@ -224,7 +224,7 @@ rag_db = None
 if args.use_rag:
     rag_db = MolRAG(args)
 
-    rag_data_path = join(args.datadir, args.dataset + '_smiles_dataset.pt')
+    rag_data_path = join('/mnt/workspace/zhaoliangjie/raggeo-ldm/', args.datadir, args.dataset + '_smiles_dataset.pt')
     rag_dataset = torch.load(rag_data_path)
 
     prop_keys = args.conditioning
